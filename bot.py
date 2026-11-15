@@ -20,7 +20,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-exchange = ccxt.okx()  # Используем OKX (Binance и Bybit блокируют Railway)
+exchange = ccxt.okx()  # OKX работает с серверами Railway без блокировок
 
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -153,15 +153,17 @@ async def analyze(message: types.Message):
         return
     
     raw_symbol, timeframe = text[0].upper(), text[1]
+    
+    # Очищаем символ от USDT, если пользователь написал BTCUSDT
     clean_symbol = raw_symbol.replace("USDT", "")
     
-    # Маппинг таймфреймов для OKX
-    tf_map = {"1h": "1H", "4h": "4H", "1d": "1D", "15m": "15m"}
-    okx_timeframe = tf_map.get(timeframe.lower(), "1H")
+    # Приводим таймфрейм к нижнему регистру, как требует ccxt (4H -> 4h)
+    okx_timeframe = timeframe.lower()
     
     await message.answer(f"Считаю SMC для {clean_symbol} на {okx_timeframe}...")
     
     try:
+        # Формируем правильный тикер для OKX (BTC/USDT)
         ticker = f"{clean_symbol}/USDT"
         ohlcv = exchange.fetch_ohlcv(ticker, okx_timeframe, limit=200)
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
@@ -177,14 +179,17 @@ async def analyze(message: types.Message):
         
         chart_buf = draw_chart(df, ticker, obs, fvgs, pd_data, sweeps)
         
-        # Безопасное форматирование (без падений)
+        # --- БЕЗОПАСНОЕ ФОРМАТИРОВАНИЕ ---
         if pd_data:
             eq_str = f"{pd_data['equilibrium']:.2f}"
             ote_top_str = f"{pd_data['ote_top']:.2f}"
             ote_bot_str = f"{pd_data['ote_bottom']:.2f}"
             zone_str = pd_data['zone']
         else:
-            eq_str = ote_top_str = ote_bot_str = zone_str = "N/A"
+            eq_str = "N/A"
+            ote_top_str = "N/A"
+            ote_bot_str = "N/A"
+            zone_str = "N/A"
 
         prompt = f"""
 Ты — профессиональный ICT/SMC трейдер. Опиши сценарий на основе ГОТОВЫХ данных. НЕ ИЩИ УРОВНИ САМ.
