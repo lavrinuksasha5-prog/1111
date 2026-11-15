@@ -2,6 +2,8 @@ import os
 import asyncio
 import logging
 import io
+import re
+import json
 import ccxt
 import pandas as pd
 import requests
@@ -28,7 +30,7 @@ client = AsyncOpenAI(
 )
 
 # ==========================================
-# SMC МАТЕМАТИКА
+# SMC МАТЕМАТИКА (ЯДРО)
 # ==========================================
 
 def calculate_rsi(series, period=14):
@@ -38,12 +40,45 @@ def calculate_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def find_swings(df, window=5):
+def get_htf_bias(symbol):
+    """LTP: Определяет глобальный тренд на 4H"""
+    try:
+        ohlcv = exchange.fetch_ohlcv(f"{symbol}/USDT", '4h', limit=50)
+        df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+        df['Swing_High'] = df['high'] == df['high'].rolling(window=5, center=True).max()
+        df['Swing_Low'] = df['low'] == df['low'].rolling(window=5, center=True).min()
+        
+        highs = df[df['Swing_High']]['high'].tolist()
+        lows = df[df['Swing_Low']]['low'].tolist()
+        
+        if len(highs) >= 3 and len(lows) >= 3:
+            if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+                return "BULLISH (HH/HL)"
+            elif highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+                return "BEARISH (LH/LL)"
+        return "RANGING"
+    except:
+        return "UNKNOWN"
+
+def find_market_structure(df, window=3):
+    """ITP: Определяет локальную структуру рынка (BOS/CHoCH)"""
     df['Swing_High'] = df['high'] == df['high'].rolling(window=window*2+1, center=True).max()
     df['Swing_Low'] = df['low'] == df['low'].rolling(window=window*2+1, center=True).min()
-    return df
+    
+    highs = df[df['Swing_High']]['high'].tolist()
+    lows = df[df['Swing_Low']]['low'].tolist()
+    
+    structure = "UNKNOWN"
+    if len(highs) >= 2 and len(lows) >= 2:
+        if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+            structure = "BULLISH"
+        elif highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+            structure = "BEARISH"
+            
+    return df, structure, highs[-1] if highs else None, lows[-1] if lows else None
 
 def find_order_blocks(df):
+    """POI: Ищет Order Blocks (последняя противоположная свеча перед импульсом)"""
     obs = []
     avg_body = (df['close'] - df['open']).abs().rolling(20).mean()
     for i in range(2, len(df) - 1):
@@ -58,6 +93,7 @@ def find_order_blocks(df):
     return obs[-5:] if len(obs) > 5 else obs
 
 def find_fvgs(df):
+    """POI: Ищет Fair Value Gaps (имбалансы)"""
     fvgs = []
     for i in range(1, len(df) - 1):
         if df['low'].iloc[i+1] > df['high'].iloc[i-1]:
@@ -66,18 +102,21 @@ def find_fvgs(df):
             fvgs.append({'type': 'bearish', 'top': df['low'].iloc[i-1], 'bottom': df['high'].iloc[i+1], 'index': i})
     return fvgs[-5:] if len(fvgs) > 5 else fvgs
 
-def find_liquidity_sweeps(df, lookback=10):
+def find_liquidity_sweeps(df, lookback=5):
+    """Manipulation: Ищет свипы ликвидности (Raid/Sweep)"""
     sweeps = []
     for i in range(lookback, len(df) - 1):
         prev_high = df['high'].iloc[i-lookback:i].max()
-        prev_low = df['low'].iloc[i-lookback:i].min()
         if df['high'].iloc[i] > prev_high and df['close'].iloc[i] < prev_high:
             sweeps.append({'type': 'bearish_sweep', 'price': df['high'].iloc[i], 'index': i})
+        
+        prev_low = df['low'].iloc[i-lookback:i].min()
         if df['low'].iloc[i] < prev_low and df['close'].iloc[i] > prev_low:
             sweeps.append({'type': 'bullish_sweep', 'price': df['low'].iloc[i], 'index': i})
     return sweeps[-3:] if len(sweeps) > 3 else sweeps
 
 def get_premium_discount(df):
+    """PD Array: Premium / Discount"""
     swings_high = df[df['Swing_High']]['high']
     swings_low = df[df['Swing_Low']]['low']
     if len(swings_high) == 0 or len(swings_low) == 0:
@@ -95,100 +134,74 @@ def get_premium_discount(df):
     }
 
 # ==========================================
-# ОТРИСОВКА ГРАФИКА (ВИЗУАЛ TRADINGVIEW + СТРЕЛКИ)
+# ОТРИСОВКА ГРАФИКА (ВИЗУАЛ TRADINGVIEW)
 # ==========================================
 
-def draw_chart(df, ticker, obs, fvgs, pd_data, sweeps):
-    df_plot = df.tail(80).copy()
+def draw_chart(df, ticker, obs, fvgs, pd_data, sweeps, trade_data):
+    df_plot = df.tail(70).copy()
     df_plot.index = pd.to_datetime(df_plot['time'], unit='ms')
     df_plot = df_plot[['open', 'high', 'low', 'close', 'volume']]
     df_plot.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
     
-    # Черно-белые свечи, как на TradingView
-    mc = mpf.make_marketcolors(up='white', down='black', edge='black', wick='black', volume='gray')
-    s = mpf.make_mpf_style(
-        marketcolors=mc, gridstyle='', y_on_right=True, facecolor='white', figcolor='white',
-        rc={'axes.labelcolor': 'black', 'xtick.color': 'black', 'ytick.color': 'black'}
-    )
+    mc = mpf.make_marketcolors(up='white', down='#0a192f', edge='#0a192f', wick='#0a192f', volume='gray')
+    s = mpf.make_mpf_style(marketcolors=mc, gridstyle='', y_on_right=True, facecolor='white', figcolor='white',
+                           rc={'axes.labelcolor': 'black', 'xtick.color': 'black', 'ytick.color': 'black'})
     
-    fig, axes = mpf.plot(df_plot, type='candle', style=s, volume=True, 
+    fig, axes = mpf.plot(df_plot, type='candle', style=s, volume=False, 
                          returnfig=True, figsize=(16, 9), tight_layout=True,
-                         scale_padding={'left': 0.5, 'right': 3.0, 'top': 0.5, 'bottom': 0.5})
+                         scale_padding={'left': 0.5, 'right': 3.5, 'top': 0.5, 'bottom': 0.5})
     ax = axes[0]
-    axes[2].set_visible(False)
     
     offset = len(df) - len(df_plot)
     current_price = df['close'].iloc[-1]
     
-    # Зоны Premium / Discount
+    # Голубые зоны имбаланса
+    for fvg in fvgs:
+        if fvg['index'] >= offset:
+            ax.add_patch(Rectangle((fvg['index'] - offset, fvg['bottom']), 30, fvg['top'] - fvg['bottom'], 
+                                   linewidth=0, facecolor='#88d8e8', alpha=0.5, zorder=0))
+            
+    # Черные линии уровней
     if pd_data:
-        ax.axhspan(pd_data['equilibrium'], pd_data['high'], alpha=0.1, color='gray', zorder=0)
-        ax.axhspan(pd_data['low'], pd_data['equilibrium'], alpha=0.25, color='gray', zorder=0)
-        ax.axhline(y=pd_data['equilibrium'], color='black', linestyle='-', linewidth=1, zorder=1)
-        ax.text(len(df_plot) + 1, pd_data['equilibrium'], '0.5', va='center', ha='left', fontsize=10, color='black')
+        ax.axhline(y=pd_data['high'], color='black', linestyle='-', linewidth=1.5, zorder=1)
+        ax.axhline(y=pd_data['low'], color='black', linestyle='-', linewidth=1.5, zorder=1)
         
-    # Order Blocks
-    for ob in obs:
-        if ob['index'] >= offset:
-            ax.add_patch(Rectangle((ob['index'] - offset, ob['bottom']), 15, ob['top'] - ob['bottom'], 
-                                   linewidth=0, facecolor='gray', alpha=0.3, zorder=0))
-            
-    # --- ЛОГИКА ДЛЯ СТРЕЛОК ---
-    is_long = True if pd_data and pd_data['zone'] == 'Discount' else False
-    target_ob = None
-    
-    if is_long:
-        valid_obs = [ob for ob in obs if ob['type'] == 'bullish' and ob['top'] < current_price]
-        if valid_obs: target_ob = valid_obs[-1]
-    else:
-        valid_obs = [ob for ob in obs if ob['type'] == 'bearish' and ob['bottom'] > current_price]
-        if valid_obs: target_ob = valid_obs[-1]
-            
-    x_start = len(df_plot) - 1
-    
-    if target_ob:
-        entry_price = (target_ob['top'] + target_ob['bottom']) / 2
-        
-        if is_long:
-            take_profit = pd_data['equilibrium'] if pd_data else current_price * 1.02
-            x_vals = [x_start, x_start + 4, x_start + 8, x_start + 12]
-            y_vals = [current_price, entry_price, entry_price, take_profit]
-            
-            ax.plot([x_start + 4, x_start + 12], [target_ob['bottom'], target_ob['bottom']], color='red', linestyle='--', alpha=0.6, linewidth=1.5)
-            ax.text(x_start + 13, target_ob['bottom'], 'SL', color='red', fontsize=10, va='center')
-            
-        else:
-            take_profit = pd_data['equilibrium'] if pd_data else current_price * 0.98
-            x_vals = [x_start, x_start + 4, x_start + 8, x_start + 12]
-            y_vals = [current_price, entry_price, entry_price, take_profit]
-            
-            ax.plot([x_start + 4, x_start + 12], [target_ob['top'], target_ob['top']], color='red', linestyle='--', alpha=0.6, linewidth=1.5)
-            ax.text(x_start + 13, target_ob['top'], 'SL', color='red', fontsize=10, va='center')
-            
-        ax.plot(x_vals, y_vals, color='black', linewidth=2, zorder=5)
-        ax.annotate('', xy=(x_vals[-1], y_vals[-1]), xytext=(x_vals[-2], y_vals[-2]),
-                    arrowprops=dict(arrowstyle='->', color='black', lw=2))
-        ax.text(x_start + 13, take_profit, 'TP', color='green', fontsize=10, va='center')
-        
-    else:
-        eq = pd_data['equilibrium'] if pd_data else current_price * 1.01
-        x_vals = [x_start, x_start + 4, x_start + 8]
-        y_vals = [current_price, eq, eq * 0.99]
-        ax.plot(x_vals, y_vals, color='black', linewidth=2, zorder=5, linestyle=':')
-        ax.annotate('', xy=(x_vals[-1], y_vals[-1]), xytext=(x_vals[-2], y_vals[-2]),
-                    arrowprops=dict(arrowstyle='->', color='black', lw=2))
+        ax.text(len(df_plot) + 1, pd_data['high'], f"{pd_data['high']:.1f}", va='center', ha='left', fontsize=10, color='white', bbox=dict(facecolor='black', edgecolor='black', boxstyle='square,pad=0.2'))
+        ax.text(len(df_plot) + 1, pd_data['low'], f"{pd_data['low']:.1f}", va='center', ha='left', fontsize=10, color='white', bbox=dict(facecolor='black', edgecolor='black', boxstyle='square,pad=0.2'))
 
-    # Метки текущей цены
+    # Сценарий (Стрелки)
+    if trade_data:
+        entry = float(trade_data.get('entry', current_price))
+        sl = float(trade_data.get('sl', current_price * 0.98))
+        tp = float(trade_data.get('tp', current_price * 1.02))
+        direction = trade_data.get('direction', 'SHORT').upper()
+        
+        x_start = len(df_plot) - 1
+        
+        if direction == 'SHORT':
+            x_vals = [x_start, x_start + 4, x_start + 9, x_start + 14]
+            y_vals = [current_price, entry, entry * 0.998, tp] 
+        else:
+            x_vals = [x_start, x_start + 4, x_start + 9, x_start + 14]
+            y_vals = [current_price, entry, entry * 1.002, tp]
+
+        ax.plot(x_vals, y_vals, color='black', linewidth=2, zorder=5)
+        ax.annotate('', xy=(x_vals[-1], y_vals[-1]), xytext=(x_vals[-2], y_vals[-2]), arrowprops=dict(arrowstyle='->', color='black', lw=2))
+
+        ax.axhline(y=sl, color='red', linestyle='-', linewidth=1.5, alpha=0.8, zorder=2)
+        ax.text(len(df_plot) + 1, sl, f"SL {sl:.1f}", color='white', fontsize=10, va='center', bbox=dict(facecolor='red', edgecolor='red', boxstyle='square,pad=0.2'))
+        
+        ax.axhline(y=tp, color='green', linestyle='--', linewidth=1.5, alpha=0.8, zorder=2)
+        ax.text(len(df_plot) + 1, tp, f"TP {tp:.1f}", color='white', fontsize=10, va='center', bbox=dict(facecolor='green', edgecolor='green', boxstyle='square,pad=0.2'))
+
+    # Текущая цена
     ax.text(len(df_plot) + 1, current_price, f'{current_price:.1f}', 
             va='center', ha='left', fontsize=10, color='white', 
             bbox=dict(facecolor='gray', edgecolor='gray', boxstyle='square,pad=0.2'))
     
-    # Оформление
-    ax.set_title('', color='black')
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.spines['left'].set_visible(False)
-    ax.grid(color='#f0f0f0', linestyle='-', linewidth=0.5)
 
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='white')
@@ -219,59 +232,75 @@ async def analyze(message: types.Message):
     
     try:
         ticker = f"{clean_symbol}/USDT"
+        
+        # 1. LTP (Контекст старшего ТФ)
+        htf_bias = get_htf_bias(clean_symbol)
+        
+        # 2. Данные для младшего ТФ
         ohlcv = exchange.fetch_ohlcv(ticker, okx_timeframe, limit=200)
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         
         df['RSI'] = calculate_rsi(df['close'])
         current_rsi = round(df['RSI'].iloc[-1], 2)
         
-        df = find_swings(df)
+        df, structure, last_high, last_low = find_market_structure(df)
         obs = find_order_blocks(df)
         fvgs = find_fvgs(df)
         sweeps = find_liquidity_sweeps(df)
         pd_data = get_premium_discount(df)
         
-        chart_buf = draw_chart(df, ticker, obs, fvgs, pd_data, sweeps)
-        
-        if pd_data:
-            eq_str = f"{pd_data['equilibrium']:.2f}"
-            ote_top_str = f"{pd_data['ote_top']:.2f}"
-            ote_bot_str = f"{pd_data['ote_bottom']:.2f}"
-            zone_str = pd_data['zone']
-        else:
-            eq_str = ote_top_str = ote_bot_str = zone_str = "N/A"
+        eq_str = f"{pd_data['equilibrium']:.2f}" if pd_data else "N/A"
+        zone_str = pd_data['zone'] if pd_data else "N/A"
 
+        # 3. Промпт по методичке (Top-Down + PO3)
         prompt = f"""
-Ты — профессиональный ICT/SMC трейдер. Опиши сценарий на основе ГОТОВЫХ данных. НЕ ИЩИ УРОВНИ САМ.
+Ты — профессиональный трейдер по Smart Money Concept (SMC). Твоя задача — не гадать, а читать поток ордеров (Order Flow) по методичке.
 
-Цена: {df['close'].iloc[-1]:.2f}
-RSI(14): {current_rsi}
-Зона: {zone_str}
-Equilibrium (0.5): {eq_str}
-OTE: {ote_bot_str} - {ote_top_str}
+ИЕРАРХИЯ АНАЛИЗА (Top-Down):
+1. LTP (Контекст старшего ТФ 4H): {htf_bias}
+2. ITP (Структура на текущем ТФ): {structure}
+3. Ликвидность: Свипы (Raid/Sweep): {sweeps}
+4. POI (Точки интереса): Order Blocks: {obs}, FVG: {fvgs}
+5. Зона: {zone_str} (EQ: {eq_str})
 
-Order Blocks: {obs}
-FVG: {fvgs}
-Liquidity Sweeps: {sweeps}
+ПРАВИЛА ПОСТРОЕНИЯ СДЕЛКИ:
+- Если HTF BIAS = BEARISH, мы ищем ТОЛЬКО SHORT. Если BULLISH — ТОЛЬКО LONG. (Против тренда не торгуем).
+- Сделка должна быть от Манипуляции к Распределению (PO3). Обязательно должен быть недавний свип (Sweep) ликвидности.
+- ВХОД: Строго от 50% (Mean Threshold) или края ближайшего FVG / OB, который остался после свипа.
+- СТОП: Строго за тень свип-хая (для шорта) или свип-лоя (для лонга). Стоп в 5 баксов от входа — это ошибка!
+- ТЕЙК: На противоположной ликвидности или полном заполнении (Full Fill) противоположного FVG.
 
-ПРАВИЛА:
-1. Если цена в Premium — только шорт. Если в Discount — только лонг.
-2. Вход на пересечении OB и FVG.
-3. Стоп за Swing High/Low. RR минимум 1:2.
-4. Напиши Основной и Альтернативный сценарий.
+ФОРМАТ ОТВЕТА:
+Сначала строго JSON (без ```json):
+{{"direction": "SHORT", "entry": 80200.0, "sl": 81000.0, "tp": 78000.0}}
 
-Пиши кратко, профессионально, на русском.
+Затем с новой строки напиши анализ по-русски:
+**Narrative (Сюжет):** Кратко опиши, что делает крупный игрок (накопление, манипуляция, распределение).
+**Ключевая зона — [Цена]$.**
+Объясни, где был свип, почему выбран этот FVG для входа и почему HTF BIAS подтверждает сделку.
 """
         
         response = await client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
+            temperature=0.2 
         )
-        analysis = response.choices[0].message.content
+        raw_response = response.choices[0].message.content
+        
+        # Парсинг JSON
+        trade_data = None
+        analysis_text = raw_response
+        try:
+            json_match = re.search(r'\{.*?\}', raw_response)
+            if json_match:
+                trade_data = json.loads(json_match.group(0))
+                analysis_text = raw_response.replace(json_match.group(0), "").strip()
+        except: pass
+        
+        chart_buf = draw_chart(df, ticker, obs, fvgs, pd_data, sweeps, trade_data)
         
         await message.answer_photo(photo=types.BufferedInputFile(chart_buf.getvalue(), filename="chart.png"))
-        await message.answer(analysis)
+        await message.answer(analysis_text)
         
     except Exception as e:
         await message.answer(f"Ошибка: {str(e)}")
