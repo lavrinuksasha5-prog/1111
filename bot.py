@@ -20,7 +20,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-exchange = ccxt.bybit()  # <--- ИЗМЕНЕНО: Binance заменен на Bybit
+exchange = ccxt.okx()  # <--- ИЗМЕНЕНО: Binance заменен на Bybit
 
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
