@@ -22,7 +22,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-exchange = ccxt.okx()
+exchange = ccxt.okx()  # OKX стабильно работает на Railway
 
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -30,7 +30,7 @@ client = AsyncOpenAI(
 )
 
 # ==========================================
-# SMC МАТЕМАТИКА
+# SMC МАТЕМАТИКА (ЯДРО)
 # ==========================================
 
 def calculate_rsi(series, period=14):
@@ -41,6 +41,7 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def find_market_structure(df, window=3):
+    """Определяет структуру рынка (BOS/CHoCH) и находит свинги"""
     df['Swing_High'] = df['high'] == df['high'].rolling(window=window*2+1, center=True).max()
     df['Swing_Low'] = df['low'] == df['low'].rolling(window=window*2+1, center=True).min()
     
@@ -57,6 +58,7 @@ def find_market_structure(df, window=3):
     return df, structure, highs[-1] if highs else None, lows[-1] if lows else None
 
 def find_order_blocks(df):
+    """Ищет Order Blocks (последняя противоположная свеча перед импульсом)"""
     obs = []
     avg_body = (df['close'] - df['open']).abs().rolling(20).mean()
     for i in range(2, len(df) - 1):
@@ -71,6 +73,7 @@ def find_order_blocks(df):
     return obs[-5:] if len(obs) > 5 else obs
 
 def find_fvgs(df):
+    """Ищет Fair Value Gaps (имбалансы)"""
     fvgs = []
     for i in range(1, len(df) - 1):
         if df['low'].iloc[i+1] > df['high'].iloc[i-1]:
@@ -80,6 +83,7 @@ def find_fvgs(df):
     return fvgs[-5:] if len(fvgs) > 5 else fvgs
 
 def find_liquidity_sweeps(df, lookback=5):
+    """Ищет свипы ликвидности (Raid/Sweep)"""
     sweeps = []
     for i in range(lookback, len(df) - 1):
         prev_high = df['high'].iloc[i-lookback:i].max()
@@ -92,6 +96,7 @@ def find_liquidity_sweeps(df, lookback=5):
     return sweeps[-3:] if len(sweeps) > 3 else sweeps
 
 def get_premium_discount(df):
+    """Определяет зоны Premium / Discount"""
     swings_high = df[df['Swing_High']]['high']
     swings_low = df[df['Swing_Low']]['low']
     if len(swings_high) == 0 or len(swings_low) == 0:
@@ -118,6 +123,7 @@ def draw_chart(df, ticker, obs, fvgs, pd_data, sweeps, trade_data):
     df_plot = df_plot[['open', 'high', 'low', 'close', 'volume']]
     df_plot.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
     
+    # Темные свечи, белый фон
     mc = mpf.make_marketcolors(up='white', down='#0a192f', edge='#0a192f', wick='#0a192f', volume='gray')
     s = mpf.make_mpf_style(marketcolors=mc, gridstyle='', y_on_right=True, facecolor='white', figcolor='white',
                            rc={'axes.labelcolor': 'black', 'xtick.color': 'black', 'ytick.color': 'black'})
@@ -130,14 +136,15 @@ def draw_chart(df, ticker, obs, fvgs, pd_data, sweeps, trade_data):
     offset = len(df) - len(df_plot)
     current_price = df['close'].iloc[-1]
     
+    # Голубые зоны FVG + линия 50%
     for fvg in fvgs:
         if fvg['index'] >= offset:
             ax.add_patch(Rectangle((fvg['index'] - offset, fvg['bottom']), 30, fvg['top'] - fvg['bottom'], 
                                    linewidth=0, facecolor='#88d8e8', alpha=0.5, zorder=0))
-            # Линия 50% (Mean Threshold) внутри FVG
             mid_fvg = (fvg['top'] + fvg['bottom']) / 2
             ax.hlines(mid_fvg, fvg['index'] - offset, fvg['index'] - offset + 30, colors='green', linestyles='dotted', linewidth=1, zorder=1)
             
+    # Линии уровней
     if pd_data:
         ax.axhline(y=pd_data['high'], color='black', linestyle='-', linewidth=1.5, zorder=1)
         ax.axhline(y=pd_data['low'], color='black', linestyle='-', linewidth=1.5, zorder=1)
@@ -145,6 +152,7 @@ def draw_chart(df, ticker, obs, fvgs, pd_data, sweeps, trade_data):
         ax.text(len(df_plot) + 1, pd_data['high'], f"{pd_data['high']:.1f}", va='center', ha='left', fontsize=10, color='white', bbox=dict(facecolor='black', edgecolor='black', boxstyle='square,pad=0.2'))
         ax.text(len(df_plot) + 1, pd_data['low'], f"{pd_data['low']:.1f}", va='center', ha='left', fontsize=10, color='white', bbox=dict(facecolor='black', edgecolor='black', boxstyle='square,pad=0.2'))
 
+    # Сценарий
     if trade_data:
         entry = float(trade_data.get('entry', current_price))
         sl = float(trade_data.get('sl', current_price * 0.98))
@@ -163,16 +171,19 @@ def draw_chart(df, ticker, obs, fvgs, pd_data, sweeps, trade_data):
         ax.plot(x_vals, y_vals, color='black', linewidth=2, zorder=5)
         ax.annotate('', xy=(x_vals[-1], y_vals[-1]), xytext=(x_vals[-2], y_vals[-2]), arrowprops=dict(arrowstyle='->', color='black', lw=2))
 
+        # Метки SL и TP
         ax.axhline(y=sl, color='red', linestyle='-', linewidth=1.5, alpha=0.8, zorder=2)
         ax.text(len(df_plot) + 1, sl, f"SL {sl:.1f}", color='white', fontsize=10, va='center', bbox=dict(facecolor='red', edgecolor='red', boxstyle='square,pad=0.2'))
         
         ax.axhline(y=tp, color='green', linestyle='--', linewidth=1.5, alpha=0.8, zorder=2)
         ax.text(len(df_plot) + 1, tp, f"TP {tp:.1f}", color='white', fontsize=10, va='center', bbox=dict(facecolor='green', edgecolor='green', boxstyle='square,pad=0.2'))
 
+    # Текущая цена
     ax.text(len(df_plot) + 1, current_price, f'{current_price:.1f}', 
             va='center', ha='left', fontsize=10, color='white', 
             bbox=dict(facecolor='gray', edgecolor='gray', boxstyle='square,pad=0.2'))
     
+    # Оси
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.spines['left'].set_visible(False)
@@ -202,7 +213,7 @@ async def analyze(message: types.Message):
     clean_symbol = raw_symbol.replace("USDT", "")
     okx_timeframe = timeframe.lower()
     
-    await message.answer(f"Считаю SMC для {clean_symbol} на {okx_timeframe}...")
+    await message.answer(f"Анализирую {clean_symbol} на {okx_timeframe}...")
     
     try:
         ticker = f"{clean_symbol}/USDT"
@@ -228,6 +239,7 @@ async def analyze(message: types.Message):
         eq_str = f"{pd_data['equilibrium']:.2f}" if pd_data else "N/A"
         zone_str = pd_data['zone'] if pd_data else "N/A"
 
+        # Промпт с жесткой структурой ответа
         prompt = f"""
 Ты — профессиональный трейдер SMC. Действуй строго по методичке.
 
@@ -245,11 +257,24 @@ async def analyze(message: types.Message):
 - СТОП: Строго за свип-хай (шорт) или свип-лой (лонг). Не ближе 10 пунктов от входа!
 - ТЕЙК: Следующая ликвидность или Full Fill FVG.
 
-ФОРМАТ ОТВЕТА:
-1. JSON (без ```json): {{"direction": "SHORT", "entry": 80200.0, "sl": 81000.0, "tp": 78000.0}}
-2. Narrative (Сюжет): Что делает крупный игрок? (Накопление/Манипуляция/Распределение).
-3. **Ключевая зона — [Цена]$.**
-4. Объясни, где свип, почему этот FVG и где стоп.
+ФОРМАТ ОТВЕТА (строго):
+Сначала JSON в одну строку (без ```json):
+{{"direction": "SHORT", "entry": 80200.0, "sl": 81000.0, "tp": 78000.0}}
+
+Затем с новой строки текст в таком формате:
+
+[PRO]
+Narrative (Сюжет): [Кратко, что делает крупный игрок]
+Ключевая зона: [Цена]$
+Логика входа: [Почему от этой зоны, где свип]
+Risk/Reward: [Соотношение]
+
+[NOOB]
+Простыми словами: [Объясни, как для новичка, куда пойдет цена]
+Что делать: [Ждать отскока от зоны X, открывать шорт/лонг, стоп ставить туда-то]
+Чего бояться: [При каком условии сценарий отменяется]
+
+Пиши строго, без смайликов, без приветствий, на русском языке.
 """
         
         response = await client.chat.completions.create(
@@ -268,10 +293,31 @@ async def analyze(message: types.Message):
                 analysis_text = raw_response.replace(json_match.group(0), "").strip()
         except: pass
         
+        # Красивое HTML-форматирование
+        analysis_text = analysis_text.replace("[PRO]", "<b>─── ПРОФЕССИОНАЛЬНЫЙ АНАЛИЗ ───</b>\n")
+        analysis_text = analysis_text.replace("[NOOB]", "\n<b>─── ОБЪЯСНЕНИЕ ДЛЯ НОВИЧКА ───</b>\n")
+        analysis_text = re.sub(r'(Narrative \(Сюжет\):)', r'<b>\1</b>', analysis_text)
+        analysis_text = re.sub(r'(Ключевая зона:)', r'<b>\1</b>', analysis_text)
+        analysis_text = re.sub(r'(Логика входа:)', r'<b>\1</b>', analysis_text)
+        analysis_text = re.sub(r'(Risk/Reward:)', r'<b>\1</b>', analysis_text)
+        analysis_text = re.sub(r'(Простыми словами:)', r'<b>\1</b>', analysis_text)
+        analysis_text = re.sub(r'(Что делать:)', r'<b>\1</b>', analysis_text)
+        analysis_text = re.sub(r'(Чего бояться:)', r'<b>\1</b>', analysis_text)
+
+        # Рисуем график
         chart_buf = draw_chart(df, ticker, obs, fvgs, pd_data, sweeps, trade_data)
         
-        await message.answer_photo(photo=types.BufferedInputFile(chart_buf.getvalue(), filename="chart.png"))
-        await message.answer(analysis_text)
+        # Отправляем картинку с заголовком
+        caption = f"<b>{clean_symbol} / {okx_timeframe.upper()}</b> | SMC Analysis\n"
+        
+        await message.answer_photo(
+            photo=types.BufferedInputFile(chart_buf.getvalue(), filename="chart.png"),
+            caption=caption,
+            parse_mode="HTML"
+        )
+        
+        # Отправляем текст
+        await message.answer(analysis_text, parse_mode="HTML")
         
     except Exception as e:
         await message.answer(f"Ошибка: {str(e)}")
