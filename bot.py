@@ -14,13 +14,13 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from openai import AsyncOpenAI
 
-# --- НАСТРОЙКИ (БЕРУТСЯ ИЗ RAILWAY VARIABLES) ---
+# --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-exchange = ccxt.okx()  # <--- ИЗМЕНЕНО: Binance заменен на Bybit
+exchange = ccxt.okx()  # Используем OKX (Binance и Bybit блокируют Railway)
 
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -28,11 +28,10 @@ client = AsyncOpenAI(
 )
 
 # ==========================================
-# SMC МАТЕМАТИКА (ЯДРО)
+# SMC МАТЕМАТИКА
 # ==========================================
 
 def calculate_rsi(series, period=14):
-    """Ручной расчет RSI без сторонних библиотек"""
     delta = series.diff(1)
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -47,16 +46,12 @@ def find_swings(df, window=5):
 def find_order_blocks(df):
     obs = []
     avg_body = (df['close'] - df['open']).abs().rolling(20).mean()
-    
     for i in range(2, len(df) - 1):
         body_next = abs(df['close'].iloc[i+1] - df['open'].iloc[i+1])
         avg = avg_body.iloc[i] if not pd.isna(avg_body.iloc[i]) else 1
-        
-        # Бычий OB
         if df['close'].iloc[i] < df['open'].iloc[i]:
             if df['close'].iloc[i+1] > df['open'].iloc[i+1] and body_next > avg * 1.5:
                 obs.append({'type': 'bullish', 'top': df['high'].iloc[i], 'bottom': df['low'].iloc[i], 'index': i})
-        # Медвежий OB
         elif df['close'].iloc[i] > df['open'].iloc[i]:
             if df['close'].iloc[i+1] < df['open'].iloc[i+1] and body_next > avg * 1.5:
                 obs.append({'type': 'bearish', 'top': df['high'].iloc[i], 'bottom': df['low'].iloc[i], 'index': i})
@@ -76,7 +71,6 @@ def find_liquidity_sweeps(df, lookback=10):
     for i in range(lookback, len(df) - 1):
         prev_high = df['high'].iloc[i-lookback:i].max()
         prev_low = df['low'].iloc[i-lookback:i].min()
-        
         if df['high'].iloc[i] > prev_high and df['close'].iloc[i] < prev_high:
             sweeps.append({'type': 'bearish_sweep', 'price': df['high'].iloc[i], 'index': i})
         if df['low'].iloc[i] < prev_low and df['close'].iloc[i] > prev_low:
@@ -86,23 +80,17 @@ def find_liquidity_sweeps(df, lookback=10):
 def get_premium_discount(df):
     swings_high = df[df['Swing_High']]['high']
     swings_low = df[df['Swing_Low']]['low']
-    
     if len(swings_high) == 0 or len(swings_low) == 0:
         return None
-    
     last_high = swings_high.iloc[-1]
     last_low = swings_low.iloc[-1]
     eq = (last_high + last_low) / 2
     current = df['close'].iloc[-1]
-    
     range_size = last_high - last_low
-    ote_top = last_low + range_size * 0.79
-    ote_bottom = last_low + range_size * 0.62
-    
     return {
         'high': last_high, 'low': last_low, 'equilibrium': eq,
         'zone': 'Premium' if current > eq else 'Discount',
-        'ote_top': ote_top, 'ote_bottom': ote_bottom,
+        'ote_top': last_low + range_size * 0.79, 'ote_bottom': last_low + range_size * 0.62,
         'current': current
     }
 
@@ -119,27 +107,22 @@ def draw_chart(df, ticker, obs, fvgs, pd_data, sweeps):
     mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', edge='inherit', wick='inherit', volume='in')
     s = mpf.make_mpf_style(marketcolors=mc, gridstyle='', y_on_right=True, facecolor='#1e222d', figcolor='#1e222d')
     
-    fig, axes = mpf.plot(df_plot, type='candle', style=s, volume=True, 
-                         returnfig=True, figsize=(14, 8), tight_layout=True)
+    fig, axes = mpf.plot(df_plot, type='candle', style=s, volume=True, returnfig=True, figsize=(14, 8), tight_layout=True)
     ax = axes[0]
     
     if pd_data:
-        ax.axhspan(pd_data['equilibrium'], pd_data['high'], alpha=0.15, color='red', label='Premium')
-        ax.axhspan(pd_data['low'], pd_data['equilibrium'], alpha=0.15, color='green', label='Discount')
-        ax.axhline(y=pd_data['equilibrium'], color='yellow', linestyle='--', linewidth=1, label='EQ 0.5')
-        ax.axhspan(pd_data['ote_bottom'], pd_data['ote_top'], alpha=0.2, color='orange', label='OTE')
+        ax.axhspan(pd_data['equilibrium'], pd_data['high'], alpha=0.15, color='red')
+        ax.axhspan(pd_data['low'], pd_data['equilibrium'], alpha=0.15, color='green')
+        ax.axhline(y=pd_data['equilibrium'], color='yellow', linestyle='--', linewidth=1)
+        ax.axhspan(pd_data['ote_bottom'], pd_data['ote_top'], alpha=0.2, color='orange')
     
     for ob in obs:
         color = 'green' if ob['type'] == 'bullish' else 'red'
-        rect = Rectangle((ob['index'], ob['bottom']), 10, ob['top'] - ob['bottom'],
-                         linewidth=1, edgecolor=color, facecolor=color, alpha=0.3)
-        ax.add_patch(rect)
+        ax.add_patch(Rectangle((ob['index'], ob['bottom']), 10, ob['top'] - ob['bottom'], linewidth=1, edgecolor=color, facecolor=color, alpha=0.3))
     
     for fvg in fvgs:
         color = 'lime' if fvg['type'] == 'bullish' else 'salmon'
-        rect = Rectangle((fvg['index'], fvg['bottom']), 8, fvg['top'] - fvg['bottom'],
-                         linewidth=1, edgecolor=color, facecolor=color, alpha=0.2, linestyle='--')
-        ax.add_patch(rect)
+        ax.add_patch(Rectangle((fvg['index'], fvg['bottom']), 8, fvg['top'] - fvg['bottom'], linewidth=1, edgecolor=color, facecolor=color, alpha=0.2, linestyle='--'))
     
     for sw in sweeps:
         marker = 'v' if 'bearish' in sw['type'] else '^'
@@ -169,37 +152,48 @@ async def analyze(message: types.Message):
         await message.answer("Формат: BTC 1h")
         return
     
-    symbol, timeframe = text[0].upper(), text[1]
-    await message.answer(f"Считаю SMC для {symbol} на {timeframe}...")
+    raw_symbol, timeframe = text[0].upper(), text[1]
+    clean_symbol = raw_symbol.replace("USDT", "")
+    
+    # Маппинг таймфреймов для OKX
+    tf_map = {"1h": "1H", "4h": "4H", "1d": "1D", "15m": "15m"}
+    okx_timeframe = tf_map.get(timeframe.lower(), "1H")
+    
+    await message.answer(f"Считаю SMC для {clean_symbol} на {okx_timeframe}...")
     
     try:
-        ticker = symbol + "/USDT" if "USDT" not in symbol else symbol
-        ohlcv = exchange.fetch_ohlcv(ticker, timeframe, limit=200)
+        ticker = f"{clean_symbol}/USDT"
+        ohlcv = exchange.fetch_ohlcv(ticker, okx_timeframe, limit=200)
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         
-        # Считаем RSI
         df['RSI'] = calculate_rsi(df['close'])
         current_rsi = round(df['RSI'].iloc[-1], 2)
         
-        # SMC математика
         df = find_swings(df)
         obs = find_order_blocks(df)
         fvgs = find_fvgs(df)
         sweeps = find_liquidity_sweeps(df)
         pd_data = get_premium_discount(df)
         
-        # Рисуем график
         chart_buf = draw_chart(df, ticker, obs, fvgs, pd_data, sweeps)
         
-        # Промпт для DeepSeek
+        # Безопасное форматирование (без падений)
+        if pd_data:
+            eq_str = f"{pd_data['equilibrium']:.2f}"
+            ote_top_str = f"{pd_data['ote_top']:.2f}"
+            ote_bot_str = f"{pd_data['ote_bottom']:.2f}"
+            zone_str = pd_data['zone']
+        else:
+            eq_str = ote_top_str = ote_bot_str = zone_str = "N/A"
+
         prompt = f"""
 Ты — профессиональный ICT/SMC трейдер. Опиши сценарий на основе ГОТОВЫХ данных. НЕ ИЩИ УРОВНИ САМ.
 
 Цена: {df['close'].iloc[-1]:.2f}
 RSI(14): {current_rsi}
-Зона: {pd_data['zone'] if pd_data else 'N/A'}
-Equilibrium (0.5): {pd_data['equilibrium']:.2f if pd_data else 'N/A'}
-OTE: {pd_data['ote_bottom']:.2f} - {pd_data['ote_top']:.2f if pd_data else 'N/A'}
+Зона: {zone_str}
+Equilibrium (0.5): {eq_str}
+OTE: {ote_bot_str} - {ote_top_str}
 
 Order Blocks: {obs}
 FVG: {fvgs}
@@ -221,7 +215,6 @@ Liquidity Sweeps: {sweeps}
         )
         analysis = response.choices[0].message.content
         
-        # Отправляем картинку + текст
         await message.answer_photo(photo=types.BufferedInputFile(chart_buf.getvalue(), filename="chart.png"))
         await message.answer(analysis)
         
