@@ -1,8 +1,8 @@
 aiogram==3.15.0
 pandas==2.2.3
+numpy==1.26.4
 ccxt==4.5.89
-pandas_ta
-openai
-requests
-mplfinance
-matplotlib
+openai==1.59.3
+requests==2.32.3
+mplfinance==0.12.10b0
+matplotlib==3.8.4
