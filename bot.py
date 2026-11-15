@@ -22,7 +22,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-exchange = ccxt.okx()  # OKX стабильно работает с Railway
+exchange = ccxt.okx()
 
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -30,7 +30,7 @@ client = AsyncOpenAI(
 )
 
 # ==========================================
-# SMC МАТЕМАТИКА (ЯДРО)
+# SMC МАТЕМАТИКА
 # ==========================================
 
 def calculate_rsi(series, period=14):
@@ -40,28 +40,7 @@ def calculate_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def get_htf_bias(symbol):
-    """LTP: Определяет глобальный тренд на 4H"""
-    try:
-        ohlcv = exchange.fetch_ohlcv(f"{symbol}/USDT", '4h', limit=50)
-        df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-        df['Swing_High'] = df['high'] == df['high'].rolling(window=5, center=True).max()
-        df['Swing_Low'] = df['low'] == df['low'].rolling(window=5, center=True).min()
-        
-        highs = df[df['Swing_High']]['high'].tolist()
-        lows = df[df['Swing_Low']]['low'].tolist()
-        
-        if len(highs) >= 3 and len(lows) >= 3:
-            if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
-                return "BULLISH (HH/HL)"
-            elif highs[-1] < highs[-2] and lows[-1] < lows[-2]:
-                return "BEARISH (LH/LL)"
-        return "RANGING"
-    except:
-        return "UNKNOWN"
-
 def find_market_structure(df, window=3):
-    """ITP: Определяет локальную структуру рынка (BOS/CHoCH)"""
     df['Swing_High'] = df['high'] == df['high'].rolling(window=window*2+1, center=True).max()
     df['Swing_Low'] = df['low'] == df['low'].rolling(window=window*2+1, center=True).min()
     
@@ -78,7 +57,6 @@ def find_market_structure(df, window=3):
     return df, structure, highs[-1] if highs else None, lows[-1] if lows else None
 
 def find_order_blocks(df):
-    """POI: Ищет Order Blocks (последняя противоположная свеча перед импульсом)"""
     obs = []
     avg_body = (df['close'] - df['open']).abs().rolling(20).mean()
     for i in range(2, len(df) - 1):
@@ -93,7 +71,6 @@ def find_order_blocks(df):
     return obs[-5:] if len(obs) > 5 else obs
 
 def find_fvgs(df):
-    """POI: Ищет Fair Value Gaps (имбалансы)"""
     fvgs = []
     for i in range(1, len(df) - 1):
         if df['low'].iloc[i+1] > df['high'].iloc[i-1]:
@@ -103,7 +80,6 @@ def find_fvgs(df):
     return fvgs[-5:] if len(fvgs) > 5 else fvgs
 
 def find_liquidity_sweeps(df, lookback=5):
-    """Manipulation: Ищет свипы ликвидности (Raid/Sweep)"""
     sweeps = []
     for i in range(lookback, len(df) - 1):
         prev_high = df['high'].iloc[i-lookback:i].max()
@@ -116,7 +92,6 @@ def find_liquidity_sweeps(df, lookback=5):
     return sweeps[-3:] if len(sweeps) > 3 else sweeps
 
 def get_premium_discount(df):
-    """PD Array: Premium / Discount"""
     swings_high = df[df['Swing_High']]['high']
     swings_low = df[df['Swing_Low']]['low']
     if len(swings_high) == 0 or len(swings_low) == 0:
@@ -155,13 +130,14 @@ def draw_chart(df, ticker, obs, fvgs, pd_data, sweeps, trade_data):
     offset = len(df) - len(df_plot)
     current_price = df['close'].iloc[-1]
     
-    # Голубые зоны имбаланса
     for fvg in fvgs:
         if fvg['index'] >= offset:
             ax.add_patch(Rectangle((fvg['index'] - offset, fvg['bottom']), 30, fvg['top'] - fvg['bottom'], 
                                    linewidth=0, facecolor='#88d8e8', alpha=0.5, zorder=0))
+            # Линия 50% (Mean Threshold) внутри FVG
+            mid_fvg = (fvg['top'] + fvg['bottom']) / 2
+            ax.hlines(mid_fvg, fvg['index'] - offset, fvg['index'] - offset + 30, colors='green', linestyles='dotted', linewidth=1, zorder=1)
             
-    # Черные линии уровней
     if pd_data:
         ax.axhline(y=pd_data['high'], color='black', linestyle='-', linewidth=1.5, zorder=1)
         ax.axhline(y=pd_data['low'], color='black', linestyle='-', linewidth=1.5, zorder=1)
@@ -169,7 +145,6 @@ def draw_chart(df, ticker, obs, fvgs, pd_data, sweeps, trade_data):
         ax.text(len(df_plot) + 1, pd_data['high'], f"{pd_data['high']:.1f}", va='center', ha='left', fontsize=10, color='white', bbox=dict(facecolor='black', edgecolor='black', boxstyle='square,pad=0.2'))
         ax.text(len(df_plot) + 1, pd_data['low'], f"{pd_data['low']:.1f}", va='center', ha='left', fontsize=10, color='white', bbox=dict(facecolor='black', edgecolor='black', boxstyle='square,pad=0.2'))
 
-    # Сценарий (Стрелки)
     if trade_data:
         entry = float(trade_data.get('entry', current_price))
         sl = float(trade_data.get('sl', current_price * 0.98))
@@ -194,7 +169,6 @@ def draw_chart(df, ticker, obs, fvgs, pd_data, sweeps, trade_data):
         ax.axhline(y=tp, color='green', linestyle='--', linewidth=1.5, alpha=0.8, zorder=2)
         ax.text(len(df_plot) + 1, tp, f"TP {tp:.1f}", color='white', fontsize=10, va='center', bbox=dict(facecolor='green', edgecolor='green', boxstyle='square,pad=0.2'))
 
-    # Текущая цена
     ax.text(len(df_plot) + 1, current_price, f'{current_price:.1f}', 
             va='center', ha='left', fontsize=10, color='white', 
             bbox=dict(facecolor='gray', edgecolor='gray', boxstyle='square,pad=0.2'))
@@ -233,10 +207,12 @@ async def analyze(message: types.Message):
     try:
         ticker = f"{clean_symbol}/USDT"
         
-        # 1. LTP (Контекст старшего ТФ)
-        htf_bias = get_htf_bias(clean_symbol)
+        # LTP: Глобальный тренд (4H)
+        ohlcv_4h = exchange.fetch_ohlcv(ticker, '4h', limit=50)
+        df_4h = pd.DataFrame(ohlcv_4h, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+        _, htf_structure, _, _ = find_market_structure(df_4h)
         
-        # 2. Данные для младшего ТФ
+        # ITP: Текущий ТФ
         ohlcv = exchange.fetch_ohlcv(ticker, okx_timeframe, limit=200)
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         
@@ -252,42 +228,37 @@ async def analyze(message: types.Message):
         eq_str = f"{pd_data['equilibrium']:.2f}" if pd_data else "N/A"
         zone_str = pd_data['zone'] if pd_data else "N/A"
 
-        # 3. Промпт по методичке (Top-Down + PO3)
         prompt = f"""
-Ты — профессиональный трейдер по Smart Money Concept (SMC). Твоя задача — не гадать, а читать поток ордеров (Order Flow) по методичке.
+Ты — профессиональный трейдер SMC. Действуй строго по методичке.
 
-ИЕРАРХИЯ АНАЛИЗА (Top-Down):
-1. LTP (Контекст старшего ТФ 4H): {htf_bias}
-2. ITP (Структура на текущем ТФ): {structure}
-3. Ликвидность: Свипы (Raid/Sweep): {sweeps}
-4. POI (Точки интереса): Order Blocks: {obs}, FVG: {fvgs}
-5. Зона: {zone_str} (EQ: {eq_str})
+КОНТЕКСТ (Top-Down):
+1. LTP (4H): {htf_structure}
+2. ITP (Текущий ТФ): {structure}
+3. Свипы (Raid): {sweeps}
+4. POI: Order Blocks: {obs}, FVG: {fvgs}
+5. Зона: {zone_str} (EQ: {eq_str}), RSI: {current_rsi}
 
-ПРАВИЛА ПОСТРОЕНИЯ СДЕЛКИ:
-- Если HTF BIAS = BEARISH, мы ищем ТОЛЬКО SHORT. Если BULLISH — ТОЛЬКО LONG. (Против тренда не торгуем).
-- Сделка должна быть от Манипуляции к Распределению (PO3). Обязательно должен быть недавний свип (Sweep) ликвидности.
-- ВХОД: Строго от 50% (Mean Threshold) или края ближайшего FVG / OB, который остался после свипа.
-- СТОП: Строго за тень свип-хая (для шорта) или свип-лоя (для лонга). Стоп в 5 баксов от входа — это ошибка!
-- ТЕЙК: На противоположной ликвидности или полном заполнении (Full Fill) противоположного FVG.
+ПРАВИЛА:
+- Не торгуй против 4H тренда.
+- Найди манипуляцию (Sweep). Без свипа нет входа.
+- Вход: 50% (Mean Threshold) или край FVG/OB.
+- СТОП: Строго за свип-хай (шорт) или свип-лой (лонг). Не ближе 10 пунктов от входа!
+- ТЕЙК: Следующая ликвидность или Full Fill FVG.
 
 ФОРМАТ ОТВЕТА:
-Сначала строго JSON (без ```json):
-{{"direction": "SHORT", "entry": 80200.0, "sl": 81000.0, "tp": 78000.0}}
-
-Затем с новой строки напиши анализ по-русски:
-**Narrative (Сюжет):** Кратко опиши, что делает крупный игрок (накопление, манипуляция, распределение).
-**Ключевая зона — [Цена]$.**
-Объясни, где был свип, почему выбран этот FVG для входа и почему HTF BIAS подтверждает сделку.
+1. JSON (без ```json): {{"direction": "SHORT", "entry": 80200.0, "sl": 81000.0, "tp": 78000.0}}
+2. Narrative (Сюжет): Что делает крупный игрок? (Накопление/Манипуляция/Распределение).
+3. **Ключевая зона — [Цена]$.**
+4. Объясни, где свип, почему этот FVG и где стоп.
 """
         
         response = await client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2 
+            temperature=0.1 
         )
         raw_response = response.choices[0].message.content
         
-        # Парсинг JSON
         trade_data = None
         analysis_text = raw_response
         try:
