@@ -1,6 +1,6 @@
 aiogram==3.15.0
 pandas==2.2.3
-ccxt
+ccxt==4.4.50
 pandas_ta
 openai
 requests
