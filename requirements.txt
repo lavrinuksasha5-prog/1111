@@ -1,6 +1,8 @@
-aiogram
+aiogram==3.15.0
 ccxt
 pandas
 pandas_ta
 openai
 requests
+mplfinance
+matplotlib
