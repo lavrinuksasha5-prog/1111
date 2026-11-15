@@ -20,7 +20,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-exchange = ccxt.okx()  # OKX работает с серверами Railway без блокировок
+exchange = ccxt.okx()  # OKX стабильно работает с Railway
 
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -95,44 +95,103 @@ def get_premium_discount(df):
     }
 
 # ==========================================
-# ОТРИСОВКА ГРАФИКА
+# ОТРИСОВКА ГРАФИКА (ВИЗУАЛ TRADINGVIEW + СТРЕЛКИ)
 # ==========================================
 
 def draw_chart(df, ticker, obs, fvgs, pd_data, sweeps):
-    df_plot = df.copy()
+    df_plot = df.tail(80).copy()
     df_plot.index = pd.to_datetime(df_plot['time'], unit='ms')
     df_plot = df_plot[['open', 'high', 'low', 'close', 'volume']]
     df_plot.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
     
-    mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', edge='inherit', wick='inherit', volume='in')
-    s = mpf.make_mpf_style(marketcolors=mc, gridstyle='', y_on_right=True, facecolor='#1e222d', figcolor='#1e222d')
+    # Черно-белые свечи, как на TradingView
+    mc = mpf.make_marketcolors(up='white', down='black', edge='black', wick='black', volume='gray')
+    s = mpf.make_mpf_style(
+        marketcolors=mc, gridstyle='', y_on_right=True, facecolor='white', figcolor='white',
+        rc={'axes.labelcolor': 'black', 'xtick.color': 'black', 'ytick.color': 'black'}
+    )
     
-    fig, axes = mpf.plot(df_plot, type='candle', style=s, volume=True, returnfig=True, figsize=(14, 8), tight_layout=True)
+    fig, axes = mpf.plot(df_plot, type='candle', style=s, volume=True, 
+                         returnfig=True, figsize=(16, 9), tight_layout=True,
+                         scale_padding={'left': 0.5, 'right': 3.0, 'top': 0.5, 'bottom': 0.5})
     ax = axes[0]
+    axes[2].set_visible(False)
     
+    offset = len(df) - len(df_plot)
+    current_price = df['close'].iloc[-1]
+    
+    # Зоны Premium / Discount
     if pd_data:
-        ax.axhspan(pd_data['equilibrium'], pd_data['high'], alpha=0.15, color='red')
-        ax.axhspan(pd_data['low'], pd_data['equilibrium'], alpha=0.15, color='green')
-        ax.axhline(y=pd_data['equilibrium'], color='yellow', linestyle='--', linewidth=1)
-        ax.axhspan(pd_data['ote_bottom'], pd_data['ote_top'], alpha=0.2, color='orange')
-    
+        ax.axhspan(pd_data['equilibrium'], pd_data['high'], alpha=0.1, color='gray', zorder=0)
+        ax.axhspan(pd_data['low'], pd_data['equilibrium'], alpha=0.25, color='gray', zorder=0)
+        ax.axhline(y=pd_data['equilibrium'], color='black', linestyle='-', linewidth=1, zorder=1)
+        ax.text(len(df_plot) + 1, pd_data['equilibrium'], '0.5', va='center', ha='left', fontsize=10, color='black')
+        
+    # Order Blocks
     for ob in obs:
-        color = 'green' if ob['type'] == 'bullish' else 'red'
-        ax.add_patch(Rectangle((ob['index'], ob['bottom']), 10, ob['top'] - ob['bottom'], linewidth=1, edgecolor=color, facecolor=color, alpha=0.3))
+        if ob['index'] >= offset:
+            ax.add_patch(Rectangle((ob['index'] - offset, ob['bottom']), 15, ob['top'] - ob['bottom'], 
+                                   linewidth=0, facecolor='gray', alpha=0.3, zorder=0))
+            
+    # --- ЛОГИКА ДЛЯ СТРЕЛОК ---
+    is_long = True if pd_data and pd_data['zone'] == 'Discount' else False
+    target_ob = None
     
-    for fvg in fvgs:
-        color = 'lime' if fvg['type'] == 'bullish' else 'salmon'
-        ax.add_patch(Rectangle((fvg['index'], fvg['bottom']), 8, fvg['top'] - fvg['bottom'], linewidth=1, edgecolor=color, facecolor=color, alpha=0.2, linestyle='--'))
+    if is_long:
+        valid_obs = [ob for ob in obs if ob['type'] == 'bullish' and ob['top'] < current_price]
+        if valid_obs: target_ob = valid_obs[-1]
+    else:
+        valid_obs = [ob for ob in obs if ob['type'] == 'bearish' and ob['bottom'] > current_price]
+        if valid_obs: target_ob = valid_obs[-1]
+            
+    x_start = len(df_plot) - 1
     
-    for sw in sweeps:
-        marker = 'v' if 'bearish' in sw['type'] else '^'
-        color = 'red' if 'bearish' in sw['type'] else 'green'
-        ax.scatter(sw['index'], sw['price'], marker=marker, color=color, s=100, zorder=5)
+    if target_ob:
+        entry_price = (target_ob['top'] + target_ob['bottom']) / 2
+        
+        if is_long:
+            take_profit = pd_data['equilibrium'] if pd_data else current_price * 1.02
+            x_vals = [x_start, x_start + 4, x_start + 8, x_start + 12]
+            y_vals = [current_price, entry_price, entry_price, take_profit]
+            
+            ax.plot([x_start + 4, x_start + 12], [target_ob['bottom'], target_ob['bottom']], color='red', linestyle='--', alpha=0.6, linewidth=1.5)
+            ax.text(x_start + 13, target_ob['bottom'], 'SL', color='red', fontsize=10, va='center')
+            
+        else:
+            take_profit = pd_data['equilibrium'] if pd_data else current_price * 0.98
+            x_vals = [x_start, x_start + 4, x_start + 8, x_start + 12]
+            y_vals = [current_price, entry_price, entry_price, take_profit]
+            
+            ax.plot([x_start + 4, x_start + 12], [target_ob['top'], target_ob['top']], color='red', linestyle='--', alpha=0.6, linewidth=1.5)
+            ax.text(x_start + 13, target_ob['top'], 'SL', color='red', fontsize=10, va='center')
+            
+        ax.plot(x_vals, y_vals, color='black', linewidth=2, zorder=5)
+        ax.annotate('', xy=(x_vals[-1], y_vals[-1]), xytext=(x_vals[-2], y_vals[-2]),
+                    arrowprops=dict(arrowstyle='->', color='black', lw=2))
+        ax.text(x_start + 13, take_profit, 'TP', color='green', fontsize=10, va='center')
+        
+    else:
+        eq = pd_data['equilibrium'] if pd_data else current_price * 1.01
+        x_vals = [x_start, x_start + 4, x_start + 8]
+        y_vals = [current_price, eq, eq * 0.99]
+        ax.plot(x_vals, y_vals, color='black', linewidth=2, zorder=5, linestyle=':')
+        ax.annotate('', xy=(x_vals[-1], y_vals[-1]), xytext=(x_vals[-2], y_vals[-2]),
+                    arrowprops=dict(arrowstyle='->', color='black', lw=2))
+
+    # Метки текущей цены
+    ax.text(len(df_plot) + 1, current_price, f'{current_price:.1f}', 
+            va='center', ha='left', fontsize=10, color='white', 
+            bbox=dict(facecolor='gray', edgecolor='gray', boxstyle='square,pad=0.2'))
     
-    ax.set_title(f'{ticker} — SMC Analysis', color='white', fontsize=14)
-    
+    # Оформление
+    ax.set_title('', color='black')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    ax.grid(color='#f0f0f0', linestyle='-', linewidth=0.5)
+
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor='#1e222d')
+    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='white')
     buf.seek(0)
     plt.close(fig)
     return buf
@@ -153,17 +212,12 @@ async def analyze(message: types.Message):
         return
     
     raw_symbol, timeframe = text[0].upper(), text[1]
-    
-    # Очищаем символ от USDT, если пользователь написал BTCUSDT
     clean_symbol = raw_symbol.replace("USDT", "")
-    
-    # Приводим таймфрейм к нижнему регистру, как требует ccxt (4H -> 4h)
     okx_timeframe = timeframe.lower()
     
     await message.answer(f"Считаю SMC для {clean_symbol} на {okx_timeframe}...")
     
     try:
-        # Формируем правильный тикер для OKX (BTC/USDT)
         ticker = f"{clean_symbol}/USDT"
         ohlcv = exchange.fetch_ohlcv(ticker, okx_timeframe, limit=200)
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
@@ -179,17 +233,13 @@ async def analyze(message: types.Message):
         
         chart_buf = draw_chart(df, ticker, obs, fvgs, pd_data, sweeps)
         
-        # --- БЕЗОПАСНОЕ ФОРМАТИРОВАНИЕ ---
         if pd_data:
             eq_str = f"{pd_data['equilibrium']:.2f}"
             ote_top_str = f"{pd_data['ote_top']:.2f}"
             ote_bot_str = f"{pd_data['ote_bottom']:.2f}"
             zone_str = pd_data['zone']
         else:
-            eq_str = "N/A"
-            ote_top_str = "N/A"
-            ote_bot_str = "N/A"
-            zone_str = "N/A"
+            eq_str = ote_top_str = ote_bot_str = zone_str = "N/A"
 
         prompt = f"""
 Ты — профессиональный ICT/SMC трейдер. Опиши сценарий на основе ГОТОВЫХ данных. НЕ ИЩИ УРОВНИ САМ.
